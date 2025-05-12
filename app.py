@@ -7,14 +7,14 @@ import plotly.graph_objects as go
 import joblib
 from datetime import datetime, timedelta
 import warnings
+import os
 warnings.filterwarnings('ignore')
 import textwrap
 from openai import OpenAI
 from dotenv import load_dotenv
-import os
 
 CSV_FILE = "data.csv"
-PREDICTED_CSV_FILE = "predictions.csv"
+PREDICTED_CSV_FILE = os.path.join("new_predictions2.csv")
 MODEL_OUTPUT = "one_class_svm_model.pkl"
 RANDOM_STATE = 42
 NU = 0.1
@@ -108,13 +108,15 @@ def detect_anomalies(df, X, model, feature_cols, selected_param):
     df['anomaly'] = df['anomaly'].map({1: 0, -1: 1})
     df['anomaly_score'] = model.decision_function(X)
     
-    mean_val = df[selected_param].mean()
-    std_val = df[selected_param].std()
-    upper_threshold = mean_val + 3 * std_val
-    lower_threshold = mean_val - 3 * std_val
+    # IQR-based thresholds
+    Q1 = df[selected_param].quantile(0.25)
+    Q3 = df[selected_param].quantile(0.75)
+    IQR = Q3 - Q1
+    upper_threshold = Q3 + 1.5 * IQR
+    lower_threshold = Q1 - 1.5 * IQR
     
     print(f"Selected Parameter: {selected_param}")
-    print(f"Mean: {mean_val:.3f}, Std: {std_val:.3f}")
+    print(f"Q1: {Q1:.3f}, Q3: {Q3:.3f}, IQR: {IQR:.3f}")
     print(f"Thresholds: Lower = {lower_threshold:.3f}, Upper = {upper_threshold:.3f}")
     print(f"Data Range: Min = {df[selected_param].min():.3f}, Max = {df[selected_param].max():.3f}")
     print(f"Number of points outside thresholds: {((df[selected_param] < lower_threshold) | (df[selected_param] > upper_threshold)).sum()}")
@@ -125,9 +127,9 @@ def detect_anomalies(df, X, model, feature_cols, selected_param):
                   lower_threshold - x if x < lower_threshold else 0
     )
     
-    return df, {'mean': mean_val, 'std': std_val, 'upper_threshold': upper_threshold, 'lower_threshold': lower_threshold}
+    return df, {'Q1': Q1, 'Q3': Q3, 'IQR': IQR, 'upper_threshold': upper_threshold, 'lower_threshold': lower_threshold}
 
-def load_predicted_anomalies(file_path, selected_param, stats):
+def load_predicted_anomalies(file_path, selected_param, iqr_stats):
     try:
         df = pd.read_csv(file_path)
     except FileNotFoundError:
@@ -156,8 +158,8 @@ def load_predicted_anomalies(file_path, selected_param, stats):
                 df['column_serial_number_original'] = 'Unknown'
 
     if f'predicted_{selected_param}' in df.columns:
-        upper_threshold = stats['upper_threshold']
-        lower_threshold = stats['lower_threshold']
+        upper_threshold = iqr_stats['upper_threshold']
+        lower_threshold = iqr_stats['lower_threshold']
         df['anomaly_deviation'] = df[f'predicted_{selected_param}'].apply(
             lambda x: x - upper_threshold if x > upper_threshold else 
                       lower_threshold - x if x < lower_threshold else 0
@@ -237,10 +239,10 @@ def main():
         return
 
     svm_model = train_anomaly_model(X)
-    filtered_data, stats = detect_anomalies(filtered_data, X, svm_model, feature_cols, selected_param)
+    filtered_data, iqr_stats = detect_anomalies(filtered_data, X, svm_model, feature_cols, selected_param)
     joblib.dump({'model': svm_model, 'scaler': scaler, 'label_encoders': label_encoders}, MODEL_OUTPUT)
 
-    future_anomalies = load_predicted_anomalies(PREDICTED_CSV_FILE, selected_param, stats)
+    future_anomalies = load_predicted_anomalies(PREDICTED_CSV_FILE, selected_param, iqr_stats)
 
     fig = go.Figure()
 
@@ -483,16 +485,13 @@ def main():
                 response = client.chat.completions.create(
                     model="gpt-4.1-nano",
                     messages=[
-                        {
-                            "role": "system",
-                            "content": (
-                                "You are a chromatography expert summarizing anomaly predictions. "
-                                "Provide a concise summary in tabular format, including Date, Parameter, Cause, and Replacement Alert. "
-                                "Ensure causes are specific to chromatography (e.g., column clogging for high peak width, contamination for high retention time) "
-                                "and include actionable recommendations. "
-                                "If no data like values are found, omit them (e.g., do not show NaN or empty fields)."
-                            )
-                        },
+                        {"role": "system", "content": (
+                            "You are a chromatography expert summarizing anomaly predictions. "
+                            "Provide a concise summary in tabular format, including Date, Parameter, Cause, and Replacement Alert. "
+                            "Ensure causes are specific to chromatography (e.g., column clogging for high peak width, contamination for high retention time) "
+                            "and include actionable recommendations. "
+                            "If no data like values are found, omit them (e.g., do not show NaN or empty fields)."
+                        )},
                         {"role": "user", "content": f"Summarize the following anomaly data: {summary_text}"}
                     ],
                     max_tokens=500
